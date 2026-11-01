@@ -106,7 +106,12 @@ function Invoke-Elevated {
             # 这个 bug 有随机性：机器快的时候任务已经开跑（0x41301）就看不出来，
             # 机器慢或首次运行时必现。换成看 State 就没有这个问题。
             $deadline = (Get-Date).AddMinutes(30)
+            # 提权进程写完退出码就说明事情干完了。等它的窗口自己关掉是不可靠的：
+            # elevate.ps1 结尾有个「按回车关闭本窗口」，用户不按就一直在 Running，
+            # 外面这个父窗口会白等（实测卡了 6 分钟以上，看起来像卡死）。
+            $doneMarker = Join-Path $env:TEMP 'claude-zh-cn-done.txt'
             while ((Get-Date) -lt $deadline) {
+                if (Test-Path -LiteralPath $doneMarker) { break }
                 $t = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
                 if ($t.State -ne 'Running') { break }
                 Start-Sleep -Milliseconds 700

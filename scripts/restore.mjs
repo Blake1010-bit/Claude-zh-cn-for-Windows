@@ -153,7 +153,19 @@ function fromArgvStamp(argv) {
 
 const wanted = argv.includes('--all') ? stamps : [fromArgvStamp(argv) ?? stamps[stamps.length - 1]]
 
+/**
+ * 备份里是不是「本工具自己装的中文包」。
+ *
+ * 为什么必须判断：install.mjs 每次安装前都会把当前文件备份一份。用户装过
+ * 两次之后，最近的那份备份其实**就是上一版中文包**，直接还原它等于什么
+ * 都没做 —— 用户点「还原」却还是中文界面（实测踩到：还原后文件大小
+ * 变回了上一版中文包，界面一点没变）。
+ * 所以「还原」的语义统一成**回到英文**：备份是中文包就删掉目标文件。
+ */
+const looksChinese = (buf) => /[\u4e00-\u9fff]/.test(buf.toString('utf8').slice(0, 40000))
+
 let restored = 0
+let cleaned = 0
 for (const stamp of wanted) {
   const dir = join(ROOT, stamp)
   if (!existsSync(dir)) {
@@ -161,7 +173,7 @@ for (const stamp of wanted) {
     console.error(`可用：${stamps.join(', ')}`)
     process.exit(1)
   }
-  console.log(`从备份还原：${stamp}`)
+  console.log(`检查备份：${stamp}`)
   for (const name of readdirSync(dir)) {
     // whitelist 是子目录，由下面单独处理
     if (name === 'whitelist') continue
@@ -170,10 +182,19 @@ for (const stamp of wanted) {
       console.log(`  – 跳过未知文件 ${name}`)
       continue
     }
+    const buf = readFileSync(join(dir, name))
+    if (looksChinese(buf)) {
+      if (existsSync(target)) {
+        unlinkSync(target)
+        console.log(`  – ${name}：备份本身也是中文包，已删除界面文件（回到英文）`)
+        cleaned++
+      }
+      continue
+    }
     // 不用 copyFileSync：从备份写到 WindowsApps 目标时，
     // copyFile 会抛 UNKNOWN(-4094)；读入内存再写出可靠。
-    writeFileSync(target, readFileSync(join(dir, name)))
-    console.log(`  ✔ ${name} → ${statSync(target).size} 字节`)
+    writeFileSync(target, buf)
+    console.log(`  ✔ ${name} → ${statSync(target).size} 字节（原文件）`)
     restored++
   }
 }
@@ -188,6 +209,22 @@ if (existsSync(wlDir)) {
   if (wl.log.length === 0) console.log('  – 没有可还原的白名单备份')
 }
 
+// 界面语言退回英文：还原的语义就是「回到英文界面」，
+// 留着 locale=zh-CN 但中文文件已删，Claude 会找不到语言而回退得很别扭。
+try {
+  const { execFileSync } = await import('node:child_process')
+  execFileSync(process.execPath, [join(PROJECT_ROOT, 'scripts', 'set-locale.mjs'), 'en-US'], {
+    stdio: 'inherit',
+    timeout: 30000,
+  })
+} catch {
+  console.log('  – 界面语言未能自动退回，可手动运行：node scripts/set-locale.mjs en-US')
+}
+
 console.log()
-console.log(`完成，共还原 ${restored} 个文件。`)
+if (restored === 0 && cleaned === 0) {
+  console.log('没有需要改动的文件 —— 界面本来就不在中文状态。')
+} else {
+  console.log(`完成：删除中文语言文件 ${cleaned} 个，还原原文件 ${restored} 个。`)
+}
 console.log('请完全退出 Claude 再重新打开（托盘图标右键 → 退出）。')

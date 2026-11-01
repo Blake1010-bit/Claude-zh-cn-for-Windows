@@ -13,8 +13,9 @@
  */
 import { existsSync, writeFileSync, unlinkSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { findResources, FRONTEND_I18N } from '../lib/paths.mjs'
+import { findResources, FRONTEND_I18N, PROJECT_ROOT } from '../lib/paths.mjs'
 import { findWhitelistFiles } from '../lib/whitelist.mjs'
+import { readPack } from '../lib/packio.mjs'
 
 const argv = process.argv.slice(2)
 const found = findResources(argv)
@@ -37,26 +38,46 @@ function writable(dir) {
   }
 }
 
+/** 去掉 UTF-8 BOM（有些编辑器会加，JSON.parse 会因此报错）。 */
+const stripBom = (s) => (s.charCodeAt(0) === 0xfeff ? s.slice(1) : s)
+
+const readJsonSafe = (p) => {
+  try {
+    return JSON.parse(stripBom(readFileSync(p, 'utf8')))
+  } catch {
+    return null
+  }
+}
+
+// 随包的中文数据。判断"要不要装"必须和它比，不能只看键齐不齐：
+// 用户装过旧版本、或者我们更新了译文之后，键是全的但译文是旧的，
+// 早先会因此认为"无需改动"（实测：旧包 84.77% 被当成已装好）。
+const PACK = {
+  front: readPack(join(PROJECT_ROOT, 'data', 'zh-CN-complete.json')),
+  shell: readPack(join(PROJECT_ROOT, 'data', 'zh-CN-desktop-complete.json')),
+}
+
 /** 语言文件是否需要补。 */
 function langNeeded() {
   const targets = [
-    [join(RES, FRONTEND_I18N, 'zh-CN.json'), join(RES, FRONTEND_I18N, 'en-US.json')],
-    [join(RES, 'zh-CN.json'), join(RES, 'en-US.json')],
+    [join(RES, FRONTEND_I18N, 'zh-CN.json'), join(RES, FRONTEND_I18N, 'en-US.json'), PACK.front],
+    [join(RES, 'zh-CN.json'), join(RES, 'en-US.json'), PACK.shell],
   ]
-  for (const [target, en] of targets) {
+  for (const [target, en, pack] of targets) {
     if (!existsSync(target)) return true // 不存在就得新建
-    try {
-      const zh = JSON.parse(stripBom(readFileSync(target, 'utf8')))
-      const enObj = JSON.parse(stripBom(readFileSync(en, 'utf8')))
-      for (const k of Object.keys(enObj)) if (!(k in zh)) return true
-    } catch {
-      return true
+    const zh = readJsonSafe(target)
+    const enObj = readJsonSafe(en)
+    if (!zh || !enObj) return true
+    for (const k of Object.keys(enObj)) {
+      if (!(k in zh)) return true
+      // 包里有的键，值必须一致；不一致说明装的是旧版译文
+      if (pack && k in pack && zh[k] !== pack[k]) return true
     }
   }
   return false
 }
 
-const stripBom = (s) => (s.charCodeAt(0) === 0xfeff ? s.slice(1) : s)
+
 
 /** 白名单是否需要补。用快速定位，避免逐个读 3000+ 个文件。 */
 function whitelistNeeded() {

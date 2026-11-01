@@ -35,11 +35,13 @@ const check = (label, enPath, zhPath) => {
   let missing = 0
   let structural = 0
   let empty = 0
+  let stillEn = 0
   const samples = []
 
   for (const k of ek) {
     if (!(k in zh)) {
       missing++
+      stillEn++
       continue
     }
     const v = zh[k]
@@ -47,6 +49,7 @@ const check = (label, enPath, zhPath) => {
       empty++
       continue
     }
+    if (v === en[k]) stillEn++
     const r = compareMessage(en[k], v)
     if (!r.ok) {
       structural++
@@ -55,14 +58,15 @@ const check = (label, enPath, zhPath) => {
   }
 
   const cjk = Object.keys(zh).filter((k) => typeof zh[k] === 'string' && /[\u4e00-\u9fff]/.test(zh[k])).length
-  const pct = ((100 * (ek.length - missing)) / ek.length).toFixed(1)
+  // 两个不同的指标，别混着看：
+  //   键覆盖率     = 当前版本需要的键里，文件里有几条（缺键会让界面漏字）
+  //   真实中文率   = 其中值真的变成中文的（品牌名/纯占位符条目本来就该留英文）
+  // 早先只报前者，显示 100%，容易被理解成"全都翻译好了"。
+  const pctKeys = ((100 * (ek.length - missing)) / ek.length).toFixed(1)
+  const pctZh = ((100 * (ek.length - stillEn)) / ek.length).toFixed(2)
 
-  console.log(`【${label}】`)
-  console.log(`  中文覆盖率      : ${pct}%`)
-  console.log(`  仍是英文        : ${missing}`)
-  console.log(`  结构损坏        : ${structural}`)
-  console.log(`  空值            : ${empty}`)
-  console.log(`  含中文的值      : ${cjk}`)
+  console.log(`【${label}】  键 ${pctKeys}% · 中文 ${pctZh}% · 结构损坏 ${structural} · 空值 ${empty}`)
+  console.log(`  中文值 ${cjk} 条，仍是英文 ${stillEn} 条（含品牌名/纯占位符等本就该留英文的）`)
   for (const [k, s, d, why] of samples) {
     console.log(`    ! ${k}`)
     console.log(`      英文: ${JSON.stringify(s).slice(0, 80)}`)

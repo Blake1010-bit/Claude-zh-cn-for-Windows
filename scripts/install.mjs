@@ -38,6 +38,7 @@ import {
   sizeOf,
 } from '../lib/paths.mjs'
 import { compareMessage } from '../lib/icu-check.mjs'
+import { readPack, packFile } from '../lib/packio.mjs'
 import { patchWhitelist } from './patch-whitelist.mjs'
 
 const argv = process.argv.slice(2)
@@ -114,6 +115,18 @@ tick(RES)
 // ===========================================================================
 step('检查随包语言数据')
 const DATA = join(PROJECT_ROOT, 'data')
+
+// 「英文原文 → 中文」字典：跨版本兼容的关键。
+//
+// Claude 每次发版都会重新生成 i18n 的键（不透明哈希），而文案本身很稳定。
+// 只按键合并的话，换一个版本命中率就是 0（实测把键换成等价的假哈希后，
+// 装完中文覆盖率 0.00%）。所以包里另带一份按原文索引的字典，安装时
+// 对「这次没匹配上、还是英文」的条目按原文回填。
+const byText = readPack(join(DATA, 'zh-CN-by-text.json')) ?? {}
+if (!Object.keys(byText).length) {
+  say('   ! 缺少 data/zh-CN-by-text.json，只能做同版本安装（换版本会大面积回退英文）')
+}
+
 const packs = [
   {
     label: '前端界面',
@@ -131,12 +144,12 @@ const packs = [
 ]
 
 for (const p of packs) {
-  if (!existsSync(p.file)) {
+  if (!packFile(p.file)) {
     say(`   ✘ 缺少数据文件：${p.file}`)
     say('   请确认下载的项目是完整的（data/ 目录不能少）。')
     process.exit(1)
   }
-  tick(`✔ ${p.label} 数据就绪（${(sizeOf(p.file) / 1024).toFixed(0)} KB）`)
+  tick(`✔ ${p.label} 数据就绪（${(sizeOf(packFile(p.file)) / 1024).toFixed(0)} KB）`)
 }
 
 // 逐个目标算清楚要补哪些键。
@@ -146,33 +159,59 @@ for (const p of packs) {
 // 仍然是 zh-CN —— 界面找不到语言文件就渲染不出来。所以目标缺失时，
 // 必须以英文文件为骨架生成一份完整的中文文件。
 for (const p of packs) {
-  const pack = readJson(p.file)
+  const pack = readPack(p.file)
   const targetExists = existsSync(p.target)
 
-  let base
-  if (targetExists) {
-    base = readJson(p.target)
-  } else if (existsSync(p.enFile)) {
-    // 用英文文件当骨架，这样文件结构与当前 Claude 版本完全对齐
-    base = readJson(p.enFile)
-    p.creating = true
-  } else {
+  // 骨架三件套，顺序很重要：
+  //   1. 当前版本的英文文件（决定"这个版本有哪些键"，缺了它界面就会漏字）
+  //   2. 已有的中文文件（保留上次的译文和旧版本遗留键）
+  //   3. 中文包（覆盖前两者）
+  //
+  // 早先的写法是「目标存在就用目标，不存在才用英文文件」，结果遇到
+  // 「中文文件被清成 {}」这种现场时，骨架里一条当前版本的键都没有，
+  // 装完界面还是英文（覆盖率 0.00%，tests/test-cross-version.mjs 用例 3）。
+  // 现在无条件以英文文件打底。
+  const enBase = existsSync(p.enFile) ? readJson(p.enFile) : {}
+  const cur = targetExists ? readJson(p.target) : {}
+  if (!Object.keys(enBase).length && !Object.keys(cur).length) {
     say(`   ✘ 既没有 ${p.target} 也没有 ${p.enFile}，无法处理 ${p.label}`)
     process.exit(1)
   }
+  const base = { ...enBase, ...cur }
+  p.creating = !targetExists
 
   // 要写入的内容 = 骨架 ∪ 中文包（中文包优先，覆盖英文）
-  const merged = { ...base, ...pack }
+  const merged = { ...base }
+  for (const [k, v] of Object.entries(pack)) {
+    // 新建文件时只需要覆盖当前版本里存在的键；
+    // 目标已存在时把旧键一并保留，方便以后降级回旧版本。
+    if (targetExists || Object.prototype.hasOwnProperty.call(base, k)) merged[k] = v
+  }
+
+  // 跨版本回填：没命中中文包、但原文在字典里的条目，按原文补上中文。
+  let textFilled = 0
+  for (const [k, v] of Object.entries(merged)) {
+    if (typeof v !== 'string') continue
+    if (Object.prototype.hasOwnProperty.call(pack, k)) continue // 包里已有这条
+    if (/[\u4e00-\u9fff]/.test(v)) continue // 已经是中文（上次装过）
+    const zh = byText[v]
+    if (typeof zh === 'string' && zh !== v && compareMessage(v, zh).ok) {
+      merged[k] = zh
+      textFilled++
+    }
+  }
+
   // 需要报告的"新增/更新"条目数
   const toAdd = {}
-  for (const [k, v] of Object.entries(pack)) {
-    if (!targetExists || base[k] !== v) toAdd[k] = v
+  for (const [k, v] of Object.entries(merged)) {
+    if (base[k] !== v) toAdd[k] = v
   }
 
   p.base = base
   p.merged = merged
   p.toAdd = toAdd
   p.total = Object.keys(toAdd).length
+  p.textFilled = textFilled
 }
 
 const grandTotal = packs.reduce((n, p) => n + p.total, 0)
@@ -244,6 +283,7 @@ for (const p of packs) {
     process.exit(1)
   }
   tick(`✔ ${p.label}：${p.total} 条通过校验`)
+  if (p.textFilled > 0) tick(`✔ ${p.label}：其中 ${p.textFilled} 条按原文补齐（跨版本）`)
 
   if (DRY) continue
 

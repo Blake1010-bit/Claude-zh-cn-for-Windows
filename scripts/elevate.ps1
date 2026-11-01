@@ -22,7 +22,7 @@
 
 param(
     [string]$ResourcesDir = '',
-    [ValidateSet('install', 'restore')]
+    [ValidateSet('install', 'restore', 'repair')]
     [string]$Mode = 'install',
     [switch]$KeepAcl,
     [switch]$NoPause
@@ -180,7 +180,13 @@ Say ''
 # 但提权后的进程是新起的，继承到的 PATH 未必和用户会话一致
 # （尤其是 nvm-windows / Volta / fnm 这类"按用户装的"版本管理器）。
 # 第一项直接借用 .bat 探到的结果，是最可靠的一条。
-$node = (Get-Command node -ErrorAction SilentlyContinue).Source
+# 注意 Select-Object -First 1：提权进程的 PATH 往往比用户会话长，
+# `Get-Command node` 可能返回**多个**匹配，此时 .Source 是一个数组，
+# 后面 `& $node ...` 会抛
+#     “程序node.exe无法运行: 索引超出了数组界限”
+# 而且这是终止性错误 —— 安装其实没跑，脚本却已经进了失败分支。
+# 早先误以为是数组展开（@nodeArgs）的问题，其实是这里。
+$node = (Get-Command node -ErrorAction SilentlyContinue | Select-Object -First 1).Source
 if (-not $node) {
     $cands = @(
         $env:CLAUDE_ZH_CN_NODE,
@@ -253,6 +259,43 @@ try {
 $user = "$env:USERDOMAIN\$env:USERNAME"
 $i18n = Join-Path $ResourcesDir 'ion-dist\i18n'
 $v1 = Join-Path $ResourcesDir 'ion-dist\assets\v1'
+
+# ---------------------------------------------------------------------------
+# 修复模式：把被我们改过的权限重置回「继承自上级」的状态
+#
+# 为什么需要：安装流程会在 Claude 目录上显式加一条 "(OI)(CI)M" 授权，
+# 正常结束时会用备份的 ACL 覆盖回去。但如果那一步被打断（用户关窗口、
+# 进程被杀），这条授权就会留在原地 —— 目录变成"当前用户可写"，
+# 下次 need-admin 探测会误判成"不用提权"，然后写到一半 EPERM。
+#
+# icacls /reset 正是这个场景的正解：它把显式 ACE 全部去掉，只保留继承来的。
+# ---------------------------------------------------------------------------
+if ($Mode -eq 'repair') {
+    Say '[修复] 重置 Claude 目录的权限为继承状态'
+    $targets = @(
+        @{ Path = $i18n;          Label = '前端语言文件目录' },
+        @{ Path = $ResourcesDir;  Label = '外壳语言文件目录' },
+        @{ Path = $v1;            Label = '前端资源目录' }
+    )
+    foreach ($t in $targets) {
+        if (-not (Test-Path -LiteralPath $t.Path)) { continue }
+        try {
+            & icacls.exe "$($t.Path)" /reset /C /Q 2>&1 | Out-Null
+            # 验证：当前用户在这条路径上还有没有显式授权
+            $acl = Get-Acl -LiteralPath $t.Path
+            $mine = @($acl.Access | Where-Object { $_.IdentityReference -eq $user -and -not $_.IsInherited })
+            if ($mine.Count -eq 0) {
+                Say "      OK   $($t.Label)"
+            } else {
+                Say "      !    $($t.Label) 仍保留 $($mine.Count) 条显式授权" 'Yellow'
+            }
+        } catch {
+            Say "      !    $($t.Label) 重置失败：$($_.Exception.Message)" 'Yellow'
+        }
+    }
+    Say ''
+    Done 0
+}
 
 # ---------------------------------------------------------------------------
 # 工具函数
@@ -332,6 +375,32 @@ Say ''
 Say ('-' * 60)
 
 # ---------------------------------------------------------------------------
+# 调 node 的统一入口
+#
+# 为什么不用 `& $node 脚本.mjs`：
+# 实测在提权后的进程里，这种原生调用会抛
+#     “程序node.exe无法运行: 索引超出了数组界限”
+# 而且它是终止性错误、$LASTEXITCODE 还留着上一条命令的 0 ——
+# 结果安装根本没跑，脚本却打印「安装完成！」（两次踩到）。
+# Start-Process -Wait -PassThru 直接拿真实退出码，绕开这个坑。
+#
+# 注意 -ArgumentList 是按空格拼接的，带空格的路径必须自己加引号。
+# ---------------------------------------------------------------------------
+function Invoke-Node {
+    param([string[]]$ArgList)
+    try {
+        $p = Start-Process -FilePath $node -ArgumentList $ArgList -NoNewWindow -Wait -PassThru -ErrorAction Stop
+        return [int]$p.ExitCode
+    } catch {
+        Say ''
+        Say "  [错误] 启动 node 失败：$($_.Exception.Message)" 'Red'
+        Say "  路径：$node" 'Yellow'
+        return 1
+    }
+}
+function Q($s) { if ($s -match '\s') { return '"' + $s + '"' } else { return $s } }
+
+# ---------------------------------------------------------------------------
 # 2. 跑安装
 # ---------------------------------------------------------------------------
 Say '[2/3] 执行安装'
@@ -339,23 +408,47 @@ Say ''
 
 if ($Mode -eq 'restore') {
     # 还原模式：只把语言文件删掉/还原成英文，不需要再跑安装校验。
-    & $node (Join-Path $scriptDir 'restore.mjs') 2>&1 | Out-Null
-    $code = $LASTEXITCODE
+    $code = Invoke-Node @((Q (Join-Path $scriptDir 'restore.mjs')))
 } else {
     # 先复验一次权限：确认刚到手的写权限在 node 眼里也有效。
     # 这一步失败就不必往下走，省得用户等到写文件时才发现 EPERM。
-    & $node (Join-Path $scriptDir 'need-admin.mjs') 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 2) {
+    $needCode = Invoke-Node @((Q (Join-Path $scriptDir 'need-admin.mjs')))
+    if ($needCode -eq 2) {
         Say ''
         Say '[错误] 权限获取后仍然写不进去。' 'Red'
         Say '可能是杀毒软件或「受控文件夹访问」拦住了，请临时关闭后重试。' 'Yellow'
         Done 1
     }
 
-    $nodeArgs = @((Join-Path $scriptDir 'install.mjs'))
-    if ($ResourcesDir) { $nodeArgs += @('--resources', $ResourcesDir) }
-    & $node @nodeArgs
-    $code = $LASTEXITCODE
+    $installScript = Join-Path $scriptDir 'install.mjs'
+    $code = 1
+    $script:installStart = (Get-Date).AddSeconds(-2)
+    if (-not (Test-Path -LiteralPath $installScript)) {
+        Say "  [错误] 找不到 $installScript" 'Red'
+    } else {
+        if ($ResourcesDir) {
+            $code = Invoke-Node @((Q $installScript), '--resources', (Q $ResourcesDir))
+        } else {
+            $code = Invoke-Node @((Q $installScript))
+        }
+        # 收尾自检：退出码是 0 也要确认语言文件真的落地了。
+        # 早先只看退出码，node 调用失败时脚本仍报「安装完成」（实际踩过）。
+        if ($code -eq 0) {
+            $zhFront = Join-Path $i18n 'zh-CN.json'
+            $zhShell = Join-Path $ResourcesDir 'zh-CN.json'
+            $okFiles = $true
+            foreach ($f in @($zhFront, $zhShell)) {
+                if (-not (Test-Path -LiteralPath $f)) {
+                    Say "  [错误] 安装后找不到 $(Split-Path -Leaf $f)：$f" 'Red'
+                    $okFiles = $false
+                } elseif ((Get-Item -LiteralPath $f).LastWriteTime -lt $script:installStart) {
+                    Say "  [错误] $(Split-Path -Leaf $f) 没有更新，安装可能没真正执行" 'Red'
+                    $okFiles = $false
+                }
+            }
+            if (-not $okFiles) { $code = 1 }
+        }
+    }
 }
 
 Say ''
