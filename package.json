@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "claude-zh-cn-for-windows",
   "version": "1.1.2",
   "description": "Claude Desktop 界面简体中文汉化（Windows）—— 仅第三方登录状态；官方账号登录模式从未开发",
@@ -13,6 +13,7 @@
     "test:cross": "node tests/test-cross-version.mjs",
     "lint": "node tests/lint.mjs",
     "build:bytext": "node tools/build-by-text.mjs",
+    "build:data": "node tools/pack-data.mjs",
     "check": "node tests/lint.mjs && node tests/test-icu.mjs && node tests/test-cross-version.mjs && node scripts/install.mjs check"
   },
   "engines": {
